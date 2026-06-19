@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>점멸 · Blink</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden;
+    font-family:'Segoe UI','Malgun Gothic',system-ui,sans-serif;color:#dfe3ee;
+    -webkit-user-select:none;user-select:none;touch-action:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;background:#0a0b0f;box-shadow:0 0 70px rgba(0,0,0,.85);cursor:none;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="960" height="600"></canvas></div>
+<script>
+(() => {
+"use strict";
+
+// ---------- 상수 ----------
+const VW=960, VH=600, PAD=44;
+const PLAYER_SPEED=212, VISION_R=128, TOTAL_LEVELS=8;
+const BLINK_DRAIN=1/2.4, BLINK_REGEN=1/1.4, BLINK_MIN=0.18;  // 점멸 게이지: 약 2.4초 지속, 1.4초 회복
+const COL_BG='#0a0b0f';
+
+const cv=document.getElementById('c');
+const ctx=cv.getContext('2d');
+
+// ---------- 오디오 (WebAudio 합성, 에셋 0) ----------
+let actx=null, master=null;
+function audioInit(){
+  if(actx) return;
+  try{
+    actx=new (window.AudioContext||window.webkitAudioContext)();
+    master=actx.createGain(); master.gain.value=0.55; master.connect(actx.destination);
+  }catch(e){ actx=null; }
+}
+function blip(freq,dur,type,vol,when){
+  if(!actx) return; type=type||'sine'; vol=vol||0.3; when=when||0;
+  const t=actx.currentTime+when, o=actx.createOscillator(), g=actx.createGain();
+  o.type=type; o.frequency.value=freq;
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.linearRampToValueAtTime(vol,t+0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g).connect(master); o.start(t); o.stop(t+dur+0.03);
+}
+function sweep(f0,f1,dur,vol,type,when){
+  if(!actx) return; type=type||'sine'; when=when||0;
+  const t=actx.currentTime+when, o=actx.createOscillator(), g=actx.createGain();
+  o.type=type; o.frequency.setValueAtTime(f0,t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),t+dur);
+  g.gain.setValueAtTime(vol,t);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g).connect(master); o.start(t); o.stop(t+dur+0.03);
+}
+function noiseBurst(dur,vol){
+  if(!actx) return;
+  const n=(actx.sampleRate*dur)|0, buf=actx.createBuffer(1,n,actx.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*(1-i/n);
+  const s=actx.createBufferSource(); s.buffer=buf;
+  const g=actx.createGain(); g.gain.value=vol;
+  const f=actx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=1100;
+  s.connect(f).connect(g).connect(master); s.start();
+}
+function heartThump(){
+  sweep(82,46,0.18,0.5,'sine',0);
+  sweep(78,44,0.16,0.32,'sine',0.16);
+}
+function sndBlinkClose(){ blip(150,0.05,'sine',0.16); }
+function sndBlinkOpen(){ blip(230,0.05,'sine',0.13); }
+function sndOrb(){ blip(660,0.10,'triangle',0.28,0); blip(990,0.12,'triangle',0.24,0.06); }
+function sndLock(){ blip(120,0.09,'square',0.12); }
+function sndDeath(){ noiseBurst(0.35,0.5); sweep(420,60,0.5,0.4,'sawtooth',0); }
+function sndClear(){ const n=[523,659,784,1047]; n.forEach((f,i)=>blip(f,0.28,'triangle',0.3,i*0.09)); }
+function sndWin(){ const n=[523,659,784,1047,1319]; n.forEach((f,i)=>blip(f,0.5,'triangle',0.32,i*0.13)); }
+
+// ---------- 상태 ----------
+let phase='title';                 // title | play | dead | clear | win
+const player={x:0,y:0,r:10};
+let enemies=[], orbs=[], particles=[], trail=[];
+const exit={x:VW-PAD-10,y:VH/2,w:18,h:104,open:false};
+let level=0, orbsLeft=0;
+let blinking=false, awaitRelease=false, energy=1;
+let blinkCount=0, deaths=0, elapsed=0;
+let hbAcc=0, danger=0, shake=0, flash=0, clearTimer=0, lockCd=0, t=0;
+let pointerHeld=false, keyHeld=false;
+const mouse={x:VW/2,y:VH/2};
+const inputHeld=()=>pointerHeld||keyHeld;
+
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const dist=(ax,ay,bx,by)=>Math.hypot(ax-bx,ay-by);
+
+// ---------- 레벨 ----------
+function placePoint(avoid){
+  for(let k=0;k<240;k++){
+    const x=rnd(PAD+30,VW-PAD-30), y=rnd(PAD+26,VH-PAD-26);
+    let ok=true;
+    for(const a of avoid){ if(dist(x,y,a.x,a.y)<a.d){ ok=false; break; } }
+    if(ok) return {x,y};
+  }
+  return {x:rnd(PAD+30,VW-PAD-30), y:rnd(PAD+26,VH-PAD-26)};
+}
+function loadLevel(i){
+  level=i;
+  if(i>=TOTAL_LEVELS){ phase='win'; awaitRelease=inputHeld(); sndWin(); return; }
+  awaitRelease=inputHeld();
+  player.x=PAD+48; player.y=VH/2;
+  enemies=[]; orbs=[]; particles=[]; trail=[];
+  blinking=false; exit.open=false; hbAcc=0; energy=1;
+  const ec=2+i, es=50+i*9, oc=3+Math.floor(i/2);
+  const avoid=[{x:player.x,y:player.y,d:135},{x:exit.x,y:exit.y,d:78}];
+  for(let o=0;o<oc;o++){
+    const p=placePoint(avoid); avoid.push({x:p.x,y:p.y,d:72});
+    orbs.push({x:p.x,y:p.y,got:false});
+  }
+  const eav=[{x:player.x,y:player.y,d:215},{x:exit.x,y:exit.y,d:92}];
+  for(const o of orbs) eav.push({x:o.x,y:o.y,d:44});
+  for(let e=0;e<ec;e++){
+    const p=placePoint(eav); eav.push({x:p.x,y:p.y,d:66});
+    enemies.push({x:p.x,y:p.y,r:12,speed:es,ghost:1,rot:rnd(0,6.28)});
+  }
+  orbsLeft=oc;
+  phase='play';
+}
+function startGame(){ level=0; deaths=0; blinkCount=0; elapsed=0; loadLevel(0); }
+
+// ---------- 입력 ----------
+function startBlink(){ blinking=true; blinkCount++; sndBlinkClose(); shake=Math.max(shake,3); for(const e of enemies) e.ghost=1; }
+function endBlink(){ if(blinking){ blinking=false; sndBlinkOpen(); shake=Math.max(shake,2.5); } }
+function forceOpen(){ if(blinking){ blinking=false; sndBlinkOpen(); awaitRelease=true; shake=Math.max(shake,8); flash=Math.max(flash,0.35); } }
+function die(){
+  phase='dead'; deaths++; blinking=false; awaitRelease=inputHeld(); shake=20; flash=1; sndDeath();
+  for(let i=0;i<26;i++){ const a=rnd(0,6.28),s=rnd(40,260);
+    particles.push({x:player.x,y:player.y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:rnd(.4,.9),max:.9,col:'255,255,255',r:rnd(2,4)}); }
+}
+function reachExit(){
+  phase='clear'; clearTimer=1.0; awaitRelease=inputHeld(); sndClear();
+  for(let i=0;i<34;i++){ const a=rnd(0,6.28),s=rnd(30,200);
+    particles.push({x:exit.x,y:exit.y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:rnd(.5,1.1),max:1.1,col:'150,225,255',r:rnd(2,4)}); }
+}
+function pickOrb(o){
+  o.got=true; orbsLeft--; sndOrb();
+  for(let i=0;i<14;i++){ const a=rnd(0,6.28),s=rnd(30,150);
+    particles.push({x:o.x,y:o.y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:rnd(.3,.6),max:.6,col:'160,225,255',r:rnd(1.5,3)}); }
+  if(orbsLeft<=0){ exit.open=true; flash=Math.max(flash,0.45);
+    blip(523,0.16,'sine',0.26,0); blip(784,0.22,'sine',0.24,0.07);
+    for(let i=0;i<30;i++){ const a=rnd(0,6.28),s=rnd(40,220);
+      particles.push({x:exit.x,y:exit.y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:rnd(.5,1.0),max:1.0,col:'150,225,255',r:rnd(2,4)}); } }
+}
+
+function unlockAudio(){ audioInit(); if(actx && actx.state==='suspended') actx.resume(); }
+function onPress(){   // 입력원(마우스/Space)이 새로 눌린 엣지
+  if(phase==='title'){ unlockAudio(); startGame(); }
+  else if(phase==='play'){
+    if(!awaitRelease && !blinking){
+      if(energy>=BLINK_MIN) startBlink();
+      else blip(110,0.07,'square',0.10);   // 게이지 부족 — 거부음
+    }
+  }
+  else if(phase==='dead'){ if(!awaitRelease) loadLevel(level); }
+  else if(phase==='win'){ if(!awaitRelease) startGame(); }
+}
+function refreshHold(){ if(!inputHeld()){ awaitRelease=false; endBlink(); } }  // 모든 입력원이 떼졌을 때만 해제
+function pointer(e){
+  const r=cv.getBoundingClientRect();
+  mouse.x=clamp((e.clientX-r.left)/r.width*VW,0,VW);
+  mouse.y=clamp((e.clientY-r.top)/r.height*VH,0,VH);
+}
+cv.addEventListener('mousemove',pointer);
+cv.addEventListener('mousedown',e=>{ e.preventDefault(); pointer(e); unlockAudio(); if(!pointerHeld){ pointerHeld=true; onPress(); } });
+window.addEventListener('mouseup',()=>{ pointerHeld=false; refreshHold(); });
+cv.addEventListener('touchstart',e=>{ e.preventDefault(); unlockAudio(); pointer(e.touches[0]); if(!pointerHeld){ pointerHeld=true; onPress(); } },{passive:false});
+cv.addEventListener('touchmove',e=>{ e.preventDefault(); pointer(e.touches[0]); },{passive:false});
+window.addEventListener('touchend',e=>{ e.preventDefault(); pointerHeld=false; refreshHold(); },{passive:false});
+window.addEventListener('blur',()=>{ pointerHeld=false; keyHeld=false; refreshHold(); });
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){ e.preventDefault(); unlockAudio(); if(!keyHeld){ keyHeld=true; onPress(); } }
+  if(e.code==='KeyR' && phase==='play'){ loadLevel(level); }
+});
+window.addEventListener('keyup',e=>{ if(e.code==='Space'){ e.preventDefault(); keyHeld=false; refreshHold(); } });
+
+// ---------- 업데이트 ----------
+function update(dt){
+  t+=dt;
+  if(shake>0) shake=Math.max(0,shake-dt*60);
+  if(flash>0) flash=Math.max(0,flash-dt*2.6);
+  if(lockCd>0) lockCd-=dt;
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i]; p.life-=dt; if(p.life<=0){ particles.splice(i,1); continue; }
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.vx*=0.92; p.vy*=0.92;
+  }
+  for(let i=trail.length-1;i>=0;i--){ trail[i].life-=dt; if(trail[i].life<=0) trail.splice(i,1); }
+
+  if(phase==='clear'){ clearTimer-=dt; if(clearTimer<=0) loadLevel(level+1); return; }
+  if(phase!=='play'){ return; }
+
+  elapsed+=dt;
+
+  if(blinking){
+    // 눈 감음: 플레이어 이동, 적 정지
+    const dx=mouse.x-player.x, dy=mouse.y-player.y, d=Math.hypot(dx,dy);
+    if(d>0.5){ const step=Math.min(PLAYER_SPEED*dt,d); player.x+=dx/d*step; player.y+=dy/d*step; }
+    player.x=clamp(player.x,PAD+player.r,VW-PAD-player.r);
+    player.y=clamp(player.y,PAD+player.r,VH-PAD-player.r);
+    trail.push({x:player.x,y:player.y,life:0.4});
+    energy-=BLINK_DRAIN*dt; if(energy<=0){ energy=0; forceOpen(); }
+    for(const e of enemies) e.ghost=Math.max(0,e.ghost-dt/0.95);
+    // 오브 수집
+    for(const o of orbs){ if(!o.got && dist(player.x,player.y,o.x,o.y)<player.r+9){ pickOrb(o); } }
+    // 출구
+    if(orbsLeft<=0){
+      if(player.x>exit.x-exit.w/2-player.r && Math.abs(player.y-exit.y)<exit.h/2+player.r){ reachExit(); return; }
+    }else if(player.x>exit.x-exit.w/2-player.r-4 && Math.abs(player.y-exit.y)<exit.h/2+player.r){
+      if(lockCd<=0){ sndLock(); lockCd=0.5; }
+    }
+  }else{
+    // 눈 뜸: 적 추격, 플레이어 정지
+    for(const e of enemies){
+      const dx=player.x-e.x, dy=player.y-e.y, d=Math.hypot(dx,dy)||1;
+      e.x+=dx/d*e.speed*dt; e.y+=dy/d*e.speed*dt;
+      e.x=clamp(e.x,PAD+e.r,VW-PAD-e.r); e.y=clamp(e.y,PAD+e.r,VH-PAD-e.r);
+      e.rot+=dt*2.4; e.ghost=1;
+    }
+    energy=Math.min(1,energy+BLINK_REGEN*dt);   // 눈 떴을 때 게이지 회복
+  }
+
+  // 충돌(어느 상태든 접촉=사망)
+  let nearest=1e9;
+  for(const e of enemies){
+    const d=dist(player.x,player.y,e.x,e.y);
+    if(d<nearest) nearest=d;
+    if(d<player.r+e.r-2){ die(); return; }
+  }
+
+  // 심박 / 위험도 (눈 떴을 때만)
+  danger=clamp(1-(nearest-46)/180,0,1);
+  if(!blinking){
+    const interval=clamp(0.30+(nearest-60)/520,0.30,1.15);
+    hbAcc+=dt; if(hbAcc>=interval){ hbAcc=0; heartThump(); shake=Math.max(shake,danger*4); }
+  }else{ hbAcc=0; }
+}
+
+// ---------- 렌더 ----------
+function drawArena(){
+  ctx.fillStyle=COL_BG; ctx.fillRect(0,0,VW,VH);
+  ctx.fillStyle='rgba(255,255,255,0.030)';
+  for(let x=PAD;x<=VW-PAD;x+=34) for(let y=PAD;y<=VH-PAD;y+=34){ ctx.fillRect(x,y,1.4,1.4); }
+  ctx.strokeStyle='rgba(120,140,180,0.16)'; ctx.lineWidth=2;
+  ctx.strokeRect(PAD,PAD,VW-PAD*2,VH-PAD*2);
+}
+function drawExit(){
+  const x=exit.x,y=exit.y,w=exit.w,h=exit.h;
+  if(exit.open){
+    const pulse=0.5+0.5*Math.sin(t*5);
+    ctx.save(); ctx.shadowColor='rgba(150,225,255,0.9)'; ctx.shadowBlur=24+pulse*14;
+    ctx.fillStyle='rgba(200,240,255,'+(0.8+pulse*0.2)+')'; ctx.fillRect(x-w/2,y-h/2,w,h);
+    ctx.restore();
+    ctx.fillStyle='rgba(150,225,255,0.85)';
+    ctx.font='12px system-ui'; ctx.textAlign='center'; ctx.fillText('EXIT',x,y-h/2-10);
+  }else{
+    ctx.fillStyle='rgba(150,160,180,0.22)'; ctx.fillRect(x-w/2,y-h/2,w,h);
+    ctx.strokeStyle='rgba(150,160,180,0.4)'; ctx.lineWidth=2; ctx.strokeRect(x-w/2,y-h/2,w,h);
+  }
+}
+function drawOrbs(){
+  for(const o of orbs){ if(o.got) continue;
+    const pulse=0.6+0.4*Math.sin(t*4+o.x*0.05);
+    ctx.save(); ctx.shadowColor='rgba(120,220,255,0.9)'; ctx.shadowBlur=14+pulse*10;
+    ctx.fillStyle='rgba(207,239,255,'+(0.85+pulse*0.15)+')';
+    ctx.beginPath(); ctx.arc(o.x,o.y,5+pulse*1.6,0,6.2832); ctx.fill(); ctx.restore();
+  }
+}
+function drawEnemy(e,active){
+  ctx.save(); ctx.translate(e.x,e.y); ctx.rotate(e.rot);
+  if(active){
+    const tint=danger>0.5?danger:0;
+    ctx.shadowColor='rgba(255,'+(120-tint*90)+','+(120-tint*90)+',0.7)'; ctx.shadowBlur=12;
+    ctx.fillStyle='rgb('+(214+tint*40)+','+(218-tint*120)+','+(230-tint*150)+')';
+  }else{ ctx.fillStyle='rgba(214,218,230,0.9)'; }
+  ctx.beginPath();
+  for(let i=0;i<4;i++){ const a=i/4*6.2832, r=i%2? e.r*0.62:e.r; ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);
+    const a2=(i+0.5)/4*6.2832; ctx.lineTo(Math.cos(a2)*(e.r*0.62),Math.sin(a2)*(e.r*0.62)); }
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle=COL_BG; ctx.beginPath(); ctx.arc(0,0,e.r*0.3,0,6.2832); ctx.fill();
+  ctx.restore();
+}
+function drawPlayer(){
+  for(const tr of trail){ const a=tr.life/0.4;
+    ctx.fillStyle='rgba(255,255,255,'+(a*0.22)+')';
+    ctx.beginPath(); ctx.arc(tr.x,tr.y,player.r*a*0.9,0,6.2832); ctx.fill(); }
+  ctx.save(); ctx.shadowColor='rgba(255,255,255,0.9)'; ctx.shadowBlur=blinking?10:18;
+  ctx.fillStyle='#ffffff'; ctx.beginPath(); ctx.arc(player.x,player.y,player.r,0,6.2832); ctx.fill();
+  ctx.restore();
+}
+function drawEnergy(){
+  if(phase!=='play') return;
+  const rad=player.r+7, a0=-Math.PI/2, a1=a0+energy*6.2832;
+  ctx.lineWidth=3;
+  ctx.strokeStyle='rgba(255,255,255,0.10)';
+  ctx.beginPath(); ctx.arc(player.x,player.y,rad,0,6.2832); ctx.stroke();
+  ctx.strokeStyle = energy<0.25 ? 'rgba(255,90,90,0.95)' : 'rgba(150,225,255,0.9)';
+  ctx.beginPath(); ctx.arc(player.x,player.y,rad,a0,a1); ctx.stroke();
+}
+function drawParticles(){
+  for(const p of particles){ const a=p.life/p.max;
+    ctx.fillStyle='rgba('+p.col+','+a+')';
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,6.2832); ctx.fill(); }
+}
+function drawReticle(){
+  ctx.strokeStyle='rgba(180,200,230,0.45)'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(mouse.x,mouse.y,9,0,6.2832); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(mouse.x-14,mouse.y); ctx.lineTo(mouse.x-4,mouse.y);
+  ctx.moveTo(mouse.x+4,mouse.y); ctx.lineTo(mouse.x+14,mouse.y);
+  ctx.moveTo(mouse.x,mouse.y-14); ctx.lineTo(mouse.x,mouse.y-4);
+  ctx.moveTo(mouse.x,mouse.y+4); ctx.lineTo(mouse.x,mouse.y+14); ctx.stroke();
+  if(blinking){ ctx.strokeStyle='rgba(150,225,255,0.25)';
+    ctx.beginPath(); ctx.moveTo(player.x,player.y); ctx.lineTo(mouse.x,mouse.y); ctx.stroke(); }
+}
+function drawHUD(){
+  ctx.textAlign='left'; ctx.fillStyle='rgba(223,227,238,0.85)'; ctx.font='15px system-ui';
+  ctx.fillText('방 '+(level+1)+' / '+TOTAL_LEVELS, 16, 26);
+  ctx.textAlign='center';
+  ctx.fillStyle=orbsLeft>0?'rgba(160,225,255,0.95)':'rgba(150,225,255,0.95)';
+  ctx.fillText(orbsLeft>0?('남은 빛 '+orbsLeft):'출구 열림 — 탈출하라', VW/2, 26);
+  ctx.textAlign='right'; ctx.fillStyle='rgba(223,227,238,0.6)';
+  ctx.fillText('점멸 '+blinkCount+'   '+elapsed.toFixed(1)+'s', VW-16, 26);
+  ctx.textAlign='center'; ctx.fillStyle='rgba(223,227,238,0.35)'; ctx.font='12px system-ui';
+  ctx.fillText(blinking?'— 눈 감음: 이동 중 —':'마우스를 눌러 눈을 감고 이동', VW/2, VH-16);
+}
+function panel(lines){
+  ctx.fillStyle='rgba(5,6,10,0.74)'; ctx.fillRect(0,0,VW,VH);
+  ctx.textAlign='center';
+  for(const l of lines){
+    ctx.fillStyle=l.c||'#ffffff'; ctx.font=(l.s||20)+'px system-ui';
+    ctx.fillText(l.t, VW/2, l.y);
+  }
+}
+
+function render(){
+  ctx.save();
+  if(shake>0) ctx.translate(rnd(-shake,shake)*0.5, rnd(-shake,shake)*0.5);
+  drawArena(); drawExit(); drawOrbs();
+  for(const e of enemies) drawEnemy(e, !blinking);
+  drawParticles(); drawPlayer(); drawEnergy();
+
+  // 시야 오버레이
+  if(phase==='play' && blinking){
+    const g=ctx.createRadialGradient(player.x,player.y,12,player.x,player.y,VISION_R);
+    g.addColorStop(0,'rgba(5,6,10,0)'); g.addColorStop(0.62,'rgba(5,6,10,0.55)'); g.addColorStop(1,'rgba(5,6,10,0.97)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,VW,VH);
+    // 적 잔상(기억)
+    for(const e of enemies){ if(e.ghost<=0.02) continue;
+      ctx.strokeStyle='rgba(180,200,235,'+(e.ghost*0.5)+')'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(e.x,e.y,e.r+2,0,6.2832); ctx.stroke(); }
+  }else if(phase==='play'){
+    const g=ctx.createRadialGradient(VW/2,VH/2,VH*0.35,VW/2,VH/2,VH*0.78);
+    g.addColorStop(0,'rgba(5,6,10,0)'); g.addColorStop(1,'rgba(5,6,10,'+(0.45+danger*0.25)+')');
+    ctx.fillStyle=g; ctx.fillRect(0,0,VW,VH);
+    if(danger>0.4){ ctx.fillStyle='rgba(120,20,30,'+((danger-0.4)*0.18)+')'; ctx.fillRect(0,0,VW,VH); }
+  }
+  drawReticle();
+  ctx.restore();
+
+  if(flash>0){ ctx.fillStyle='rgba(255,255,255,'+(flash*0.7)+')'; ctx.fillRect(0,0,VW,VH); }
+
+  if(phase==='play'||phase==='clear') drawHUD();
+
+  if(phase==='title'){
+    panel([
+      {t:'점 멸', y:168, s:60, c:'#ffffff'},
+      {t:'B L I N K', y:204, s:16, c:'rgba(150,225,255,0.7)'},
+      {t:'빛이 있을 때만 적이 움직인다. 눈을 감는 건 너다.', y:258, s:18, c:'rgba(223,227,238,0.9)'},
+      {t:'누르면 → 눈을 감아 이동 (적 정지 · 시야 좁아짐)', y:300, s:15, c:'rgba(200,210,225,0.8)'},
+      {t:'떼면 → 눈을 떠 멈춤 (적이 추격해 온다)', y:326, s:15, c:'rgba(200,210,225,0.8)'},
+      {t:'점멸 게이지가 닳으면 강제로 눈이 떠진다 — 떠서 회복하라', y:356, s:15, c:'rgba(150,225,255,0.85)'},
+      {t:'모든 빛을 모아 출구로 탈출 · 접촉하면 죽는다', y:386, s:15, c:'rgba(200,210,225,0.8)'},
+      {t:'클릭하여 시작', y:452, s:22, c:'#ffffff'},
+    ]);
+  }else if(phase==='dead'){
+    panel([
+      {t:'사망', y:250, s:52, c:'#ff6b6b'},
+      {t:'방 '+(level+1)+' 에서 적과 접촉했다', y:300, s:18, c:'rgba(223,227,238,0.85)'},
+      {t:'클릭하여 이 방 다시 시도', y:360, s:20, c:'#ffffff'},
+    ]);
+  }else if(phase==='win'){
+    panel([
+      {t:'탈출 성공', y:210, s:54, c:'#ffffff'},
+      {t:'8개의 방을 모두 빠져나왔다', y:262, s:20, c:'rgba(150,225,255,0.9)'},
+      {t:'시간 '+elapsed.toFixed(1)+'s   ·   점멸 '+blinkCount+'회   ·   사망 '+deaths, y:312, s:18, c:'rgba(223,227,238,0.85)'},
+      {t:'클릭하여 처음부터 다시', y:380, s:20, c:'#ffffff'},
+    ]);
+  }
+}
+
+// ---------- 루프 ----------
+let lastT=performance.now();
+function frame(now){
+  let dt=(now-lastT)/1000; lastT=now;
+  if(dt>0.05) dt=0.05;
+  update(dt); render();
+  requestAnimationFrame(frame);
+}
+
+// ---------- 리사이즈 ----------
+function resize(){
+  const s=Math.min(window.innerWidth/VW, window.innerHeight/VH);
+  cv.style.width=(VW*s)+'px'; cv.style.height=(VH*s)+'px';
+}
+window.addEventListener('resize',resize);
+resize();
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
